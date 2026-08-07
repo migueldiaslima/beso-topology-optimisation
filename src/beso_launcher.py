@@ -20,8 +20,29 @@ import glob
 from datetime import datetime
 
 PORT = 8087
-CONFIG_FILE = "beso_config.json"
-PID_FILE    = "beso_pid.json"
+
+# [v51] The folder the scripts live in. Everything the launcher hands to the
+# optimiser must be anchored here, NOT to the launcher process's working
+# directory. The optimiser subprocess is always started with cwd=SCRIPT_DIR, so
+# this is the only folder both sides agree on. They differ whenever the launcher
+# is started from somewhere other than its own folder, for example
+# "python D:\\BESO\\beso_launcher.py" typed from C:\\Users\\Miguel.
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+
+# [v51] Was the bare name "beso_config.json", written relative to the launcher's
+# working directory while beso_main.py / beso_lattice_main.py read it relative
+# to SCRIPT_DIR. When those folders differed the engine either found no config
+# at all (and fell into its interactive menu with no terminal attached to answer
+# it) or, worse, found a leftover config from a previous run and silently
+# optimised with the wrong settings. Now both sides name the same file.
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "beso_config.json")
+# [v52] Anchored to SCRIPT_DIR for the same reason as CONFIG_FILE. Only the
+# launcher reads and writes this file, so a bare name was self-consistent rather
+# than wrong, but it meant the launcher could only find its own PID file when
+# started from the same folder as last time. Start it from somewhere else and a
+# run that is still going becomes invisible: no "already running" warning, and
+# the Stop button has nothing to kill.
+PID_FILE    = os.path.join(SCRIPT_DIR, "beso_pid.json")
 
 # =============================================================================
 #   RUN STATE  (shared between threads - always access under _run_lock)
@@ -53,6 +74,29 @@ _stl_popup_shown = False
 
 # Stale temp files detected at launcher startup
 _stale_temp_files = []
+
+# ---- Spawned script resolution ----------------------------------------------
+
+def resolve_spawned_script(script_name):
+    """[v52] Absolute path to a script the launcher spawns (an optimiser engine
+    or an STL generator), or None if it is not next to beso_launcher.py.
+
+    Everything the launcher spawns runs with cwd=SCRIPT_DIR, so SCRIPT_DIR is
+    the only folder worth looking in. The STL sites used to also search
+    os.getcwd(), which is reached only when the real file is missing, and which
+    could then pick up a stale older copy from whatever folder the launcher
+    happened to be started in."""
+    path = os.path.join(SCRIPT_DIR, script_name)
+    return path if os.path.isfile(path) else None
+
+
+def missing_script_error(script_name):
+    """[v52] One wording for every "the launcher cannot find a script it needs"
+    case, so the engine and STL failures read the same way."""
+    return ("Script '{}' was not found in {}.\n\n"
+            "beso_launcher.py and the optimiser and STL scripts must all sit in "
+            "the same folder.").format(script_name, SCRIPT_DIR)
+
 
 # ---- PID file helpers -------------------------------------------------------
 
@@ -114,29 +158,102 @@ def kill_stl_process():
             pass
         _stl_proc = None
 
+def sanitize_job_name(name):
+    """[v50] Abaqus-safe job name. Must stay byte-for-byte equivalent to
+    sanitize_job_name() in beso_main.py / beso_lattice_main.py and to
+    sanitizeJobName() in the browser, so all three agree on the name the run
+    will actually use."""
+    safe = ""
+    for ch in str(name).strip():
+        if ("a" <= ch <= "z") or ("A" <= ch <= "Z") or \
+           ("0" <= ch <= "9") or ch == "_":
+            safe += ch
+        else:
+            safe += "_"
+    safe = safe.strip("_")
+    if not safe:
+        return "beso_job"
+    if "0" <= safe[0] <= "9":
+        safe = "job_" + safe
+    return safe
+
+
+def derive_job_name(inp_path):
+    """The job name the optimisers will derive from this model path.
+
+    Splits on BOTH separators rather than using os.path.basename, which only
+    understands backslashes on Windows. The browser always splits on both, so
+    doing the same here keeps the name shown in the UI and the name computed on
+    the server identical on every host."""
+    if not inp_path:
+        return ""
+    tail = str(inp_path).strip().replace("\\", "/").rstrip("/").split("/")[-1]
+    stem = os.path.splitext(tail)[0]
+    return sanitize_job_name(stem)
+
+
+def is_run_leftover(entry, job_name):
+    """[v52] True when a name in the script folder is debris from an earlier run.
+
+    Two families are matched:
+
+      "<job_name>.*"   artefacts of the base pre-flight solve. Since v50 these
+                       are archived into the run folder the moment the pre-flight
+                       finishes, so they only survive a crash or a cancel during
+                       the pre-flight itself.
+
+      "iteration_*"    artefacts of a design iteration. These are what a cancel
+                       actually leaves behind, because cleanup_files only runs
+                       once an iteration has completed. Cancelling during
+                       iteration N strands iteration_<dir>_N.inp/.odb/.dat/.msg/
+                       .sta/.prt/.com/.sim, plus a .lck under real Abaqus, which
+                       makes the solver refuse to re-run that job.
+                       Both naming schemes are covered: iteration_+Z_7 from the
+                       solid-void engine and iteration_7 from the lattice engine.
+
+    Archived iterations are NOT matched: they live inside Latest_Classic_Run and
+    Latest_Lattice_Run, which os.listdir does not descend into.
+    """
+    low = entry.lower()
+    if job_name and low == (job_name + ".inp").lower():
+        return False        # the staged working copy itself is not junk
+    if job_name and low.startswith(job_name.lower() + "."):
+        return True
+    if low.startswith("iteration_"):
+        return True
+    return False
+
+
 def scan_abaqus_leftovers(inp_path):
     """
-    Find all job-named files/folders in the INP directory that are leftover
-    Abaqus artifacts, excluding the .inp file itself.
+    Find leftover Abaqus artifacts that would collide with this run.
+
+    [v50] These used to be scanned for in the INP file's own directory, because
+    the optimiser solved the user's model in place. The optimiser now stages a
+    working copy into the script folder and solves there, so that is where any
+    leftovers are, and the user's model folder is left alone entirely.
+
+    [v52] Widened to cover iteration artefacts. Previously only "<job_name>.*"
+    was matched, which meant a run cancelled mid-iteration produced no warning
+    at all: its stranded iteration files were invisible to this scan, and the
+    base artefacts it did look for had already been archived away by
+    archive_preflight_artifacts.
+
     Returns a list of dicts: {name, path, is_dir}.
     """
-    if not inp_path or not os.path.isfile(inp_path):
-        return [], ""
-    directory  = os.path.dirname(os.path.abspath(inp_path))
-    basename   = os.path.basename(inp_path)
-    job_name   = os.path.splitext(basename)[0]   # e.g. "beam_beso_base"
-    leftovers  = []
+    job_name  = derive_job_name(inp_path)
+    directory = SCRIPT_DIR
+    leftovers = []
     try:
         for entry in os.listdir(directory):
-            if entry == basename:
-                continue   # keep the .inp file
-            if entry.lower().startswith(job_name.lower() + '.'):
-                full = os.path.join(directory, entry)
-                leftovers.append({
-                    "name":   entry,
-                    "path":   full,
-                    "is_dir": os.path.isdir(full)
-                })
+            if not is_run_leftover(entry, job_name):
+                continue
+            full = os.path.join(directory, entry)
+            leftovers.append({
+                "name":   entry,
+                "path":   full,
+                "is_dir": os.path.isdir(full)
+            })
     except Exception:
         pass
     return sorted(leftovers, key=lambda x: x["name"]), directory
@@ -517,8 +634,11 @@ def inspect_inp_file(inp_path):
         "design_part": None,
         "parts_detected": 0,
         "material_fallback": False,
+        "job_name": None,          # [v50] the Abaqus job name this file yields
         "errors": []
     }
+
+    result["job_name"] = derive_job_name(inp_path)
 
     if not inp_path:
         result["errors"].append("No file path provided.")
@@ -911,11 +1031,59 @@ def read_density_manifest(folder_path):
     return None
 
 
+# [v54] Taubin pass-band. The generator hardcodes mu=-0.53, which is the
+# correct partner for lambda=0.5 and ONLY for lambda=0.5: the shrink-free
+# property depends on the lambda/mu pairing. Leaving mu fixed while the UI
+# varies lambda amplifies low frequencies instead of damping them, and the mesh
+# inflates without bound. Measured bounding-box deviation on a 120 mm part at 60
+# iterations with mu fixed at -0.53: +0.7 mm at lambda 0.5, +3.6 mm at 0.4,
+# +134 mm at 0.3, +3.4e10 mm at 0.1.
+TAUBIN_PASS_BAND = 0.1
+
+
+def taubin_mu(lam):
+    """The mu that pairs with this lambda for a fixed Taubin pass-band.
+
+    mu = 1 / (k_PB - 1/lambda). At lambda 0.5 this gives -0.5263, i.e. the
+    generator's own default, so existing behaviour is preserved; away from 0.5
+    it keeps the filter stable and makes lambda behave as a monotonic strength
+    dial (0.18 mm deviation at 0.1 rising to 1.30 mm at 0.9)."""
+    try:
+        lam = float(lam)
+    except (TypeError, ValueError):
+        return -0.5263
+    if lam <= 0.0:
+        return -0.5263
+    return round(1.0 / (TAUBIN_PASS_BAND - 1.0 / lam), 4)
+
+
+def find_non_design_csv(folder_path):
+    """[v54] Absolute path to non_design_elements.csv for this data folder, or
+    None.
+
+    A run writes the CSV triplet into BOTH Data_Files/ and
+    Data_Files/geom_final/, but non_design_elements.csv only into Data_Files/.
+    So it is a sibling when the user picks Data_Files (which is what the
+    launcher auto-populates) and one level up when they pick geom_final. Both
+    are checked, folder first."""
+    if not folder_path or not os.path.isdir(folder_path):
+        return None
+    here = os.path.join(folder_path, "non_design_elements.csv")
+    if os.path.isfile(here):
+        return os.path.abspath(here)
+    parent = os.path.join(os.path.dirname(os.path.abspath(folder_path)),
+                          "non_design_elements.csv")
+    if os.path.isfile(parent):
+        return os.path.abspath(parent)
+    return None
+
+
 def scan_stl_folder(folder_path):
     """Checks a folder for STL-generation inputs. Returns engine type and file status."""
     if not os.path.isdir(folder_path):
         return {"valid": False, "engine": None,
                 "nodes": False, "elements": False, "solid": False,
+                "non_design": False, "non_design_path": None,
                 "density_map": False, "detected_lattice_type": None}
     # Solid-void files
     nodes       = os.path.exists(os.path.join(folder_path, "best_nodes.csv"))
@@ -936,8 +1104,13 @@ def scan_stl_folder(folder_path):
         engine = None
         valid  = False
 
+    # [v54] Optional: absent only means the functional features cannot be held
+    # still during smoothing, so it never affects "valid".
+    nd_path = find_non_design_csv(folder_path)
+
     return {"valid": valid, "engine": engine,
             "nodes": nodes, "elements": elements, "solid": solid,
+            "non_design": nd_path is not None, "non_design_path": nd_path,
             "density_map": density_map,
             "detected_lattice_type": (read_density_manifest(folder_path) if density_map else None)}
 
@@ -3165,15 +3338,17 @@ HTML = r"""<!DOCTYPE html>
 
   .csv-status-grid {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 10px;
+    /* [v54] Four columns: the optional non_design_elements.csv joins the three
+       required files. Boxes are slimmer so the longer names still fit. */
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
     margin-bottom: 0;
   }
 
   .csv-status-grid.single { grid-template-columns: 1fr; }
 
   .csv-status-item {
-    padding: 12px;
+    padding: 7px 9px;
     background: var(--bg2);
     border: 1px solid var(--border);
     border-radius: 6px;
@@ -3184,6 +3359,9 @@ HTML = r"""<!DOCTYPE html>
 
   .csv-status-item.found   { border-color: var(--green-dim); }
   .csv-status-item.missing { border-color: var(--red-dim);   }
+  /* [v54] An optional input that was not found is amber, not red: the run still
+     works, it just cannot protect the non-design features. */
+  .csv-status-item.optional-missing { border-color: var(--yellow-dim); }
 
   .csv-dot {
     width: 6px; height: 6px;
@@ -3193,11 +3371,13 @@ HTML = r"""<!DOCTYPE html>
 
   .csv-status-item.found   .csv-dot { background: var(--green); }
   .csv-status-item.missing .csv-dot { background: var(--red);   }
+  .csv-status-item.optional-missing .csv-dot { background: var(--yellow); }
 
   .csv-label {
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: 10px;
     color: var(--text2);
+    word-break: break-all;
   }
 
   /* Pre-flight info panel */
@@ -3644,10 +3824,14 @@ HTML = r"""<!DOCTYPE html>
         </div>
 
         <div class="field">
-          <label>Base Job Name</label>
-          <input type="text" id="baseJob" placeholder="beam_beso_base"
-                 oninput="syncJobName()" />
-          <div class="field-hint">Filename without .inp extension</div>
+          <label>Base Job Name (derived)</label>
+          <input type="text" id="baseJob" placeholder="derived from the file above"
+                 readonly />
+          <div class="field-hint">
+            Abaqus job name for this run, derived from the file above. Characters
+            Abaqus cannot use in a job name become underscores. Your file keeps
+            its own name and is never modified.
+          </div>
         </div>
 
         <!-- Detected properties panel -->
@@ -3827,7 +4011,7 @@ HTML = r"""<!DOCTYPE html>
           </div>
 
           <div class="field">
-            <label>Transverse Conductivity K22 <span class="tip" data-tip="Thermal conductivity assigned perpendicular to the print direction, in W/m.K. Controls heat flow through lattice and void elements in the transverse plane. Used only when the thermal step is active." onmouseenter="showTip(this)" onmouseleave="hideTip()">?</span></label>
+            <label>Transverse Conductivity K22 Percentage <span class="tip" data-tip="Thermal conductivity assigned perpendicular to the print direction. Units in W/m.K, controlled in terms of percentage of build direction Conductivity. Default is 5 per cent. Controls heat flow through elements in the transverse plane. Used only when the thermal step is active." onmouseenter="showTip(this)" onmouseleave="hideTip()">?</span></label>
             <input type="number" id="k22" value="5.0" min="0.001" step="0.5" />
             
           </div>
@@ -3902,7 +4086,7 @@ HTML = r"""<!DOCTYPE html>
             
           </div>
 
-          <div class="field">
+          <div class="field" id="microRadiusField">
             <label>Micro Radius - Overhang (mm) <span class="tip" data-tip="Smearing radius for the printability overhang penalty, in mm. Controls how far the penalty spreads from detected unsupported surfaces into the surrounding elements." onmouseenter="showTip(this)" onmouseleave="hideTip()">?</span></label>
             <input type="number" id="microRadius" value="2.0" min="0.5" step="0.5" />
             
@@ -4273,7 +4457,7 @@ HTML = r"""<!DOCTYPE html>
 
               <!-- Solid-void file indicators -->
               <div id="stlSVFiles">
-                <div class="section-sub" style="margin-top:14px">Required Files</div>
+                <div class="section-sub" style="margin-top:14px">Input Files</div>
                 <div class="csv-status-grid" id="csvStatusGrid">
                   <div class="csv-status-item" id="csv-nodes">
                     <div class="csv-dot"></div>
@@ -4286,6 +4470,13 @@ HTML = r"""<!DOCTYPE html>
                   <div class="csv-status-item" id="csv-solid">
                     <div class="csv-dot"></div>
                     <div class="csv-label">best_solid_elements.csv</div>
+                  </div>
+                  <!-- [v54] Optional. Lists the elements the optimiser was never
+                       allowed to remove, so the STL generator can hold those
+                       surfaces still while it smooths everything else. -->
+                  <div class="csv-status-item" id="csv-nondesign">
+                    <div class="csv-dot"></div>
+                    <div class="csv-label">non_design_elements.csv</div>
                   </div>
                 </div>
               </div>
@@ -4351,23 +4542,41 @@ HTML = r"""<!DOCTYPE html>
             </div>
             <div class="panel-body" style="padding-top:8px">
               <div id="stlSVOptions">
+                <!-- [v54] The old two-way toggle named a method the launcher
+                     never actually requested: --smooth-method was never sent,
+                     so the generator's default (Taubin) is what always ran.
+                     The method is now chosen explicitly and genuinely sent. -->
                 <div class="field">
-                  <label>Smoothing</label>
+                  <label>Smoothing <span class="tip" data-tip="How the staircased voxel surface is smoothed into a printable shape. None keeps the raw faceted mesh. Taubin is the recommended default: it alternates a smoothing pass with a slight inflating pass, so the part keeps its size instead of shrinking away with every iteration. HC (Humphrey&apos;s Classes) pulls each vertex back toward its original position every pass, so it converges quickly and stays very close to the original dimensions, but removes less of the staircasing." onmouseenter="showTip(this)" onmouseleave="hideTip()">?</span></label>
                   <div class="toggle-group">
                     <input type="radio" name="stlSmooth" id="stlSmoothOff" value="off" checked onchange="toggleSmoothOptions()">
                     <label for="stlSmoothOff">None</label>
-                    <input type="radio" name="stlSmooth" id="stlSmoothOn" value="on" onchange="toggleSmoothOptions()">
-                    <label for="stlSmoothOn">HC Laplacian</label>
+                    <input type="radio" name="stlSmooth" id="stlSmoothTaubin" value="taubin" onchange="toggleSmoothOptions()">
+                    <label for="stlSmoothTaubin">Taubin</label>
+                    <input type="radio" name="stlSmooth" id="stlSmoothHC" value="hc" onchange="toggleSmoothOptions()">
+                    <label for="stlSmoothHC">HC</label>
                   </div>
                 </div>
                 <div id="smoothIterField" style="display:none">
                   <div class="field">
-                    <label>Smooth Iterations</label>
-                    <input type="number" id="stlSmoothIter" value="10" min="1" max="100" step="1" />
+                    <label>Smooth Iterations <span class="tip" data-tip="How many smoothing passes to run. More passes give a smoother surface and a larger departure from the original faceted geometry. 60 is the recommended default for Taubin. HC has usually converged by about 10, so extra passes there change very little." onmouseenter="showTip(this)" onmouseleave="hideTip()">?</span></label>
+                    <input type="number" id="stlSmoothIter" value="60" min="1" max="200" step="1" />
                   </div>
                   <div class="field">
-                    <label>Lambda (strength)</label>
+                    <label>Lambda (strength) <span class="tip" data-tip="Strength of each smoothing pass. Higher values smooth faster and deviate further from the original geometry; lower values are gentler. The companion mu parameter is derived from this automatically to keep Taubin shrink-free, so any value in this range is safe to use." onmouseenter="showTip(this)" onmouseleave="hideTip()">?</span></label>
                     <input type="number" id="stlSmoothLambda" value="0.5" min="0.1" max="1.0" step="0.05" />
+                  </div>
+                </div>
+                <div class="field">
+                  <label>Protect Non-Design Features <span class="tip" data-tip="Protects the elements listed in non_design_elements.csv, which are the features you told the optimiser it may never remove: bolt holes, bearing bores, mating faces, load and mounting surfaces. With this On those surfaces are held in place while everything around them is smoothed, so a hole stays round and a flat face stays flat and on-plane. Flat protected faces are still allowed to slide slightly within their own plane, which straightens the ragged stair-stepped edge where protected meets optimised, and to move up to 0.5 mm perpendicular to themselves, which flattens leftover voxel bumps sitting on the face. Bore walls and sharp edges are pinned exactly and never move at all. Turn this Off only if you want the whole part smoothed uniformly and do not need the functional features to hold their dimensions. If the CSV is missing, this has no effect." onmouseenter="showTip(this)" onmouseleave="hideTip()">?</span></label>
+                  <div class="toggle-group">
+                    <input type="radio" name="stlLock" id="stlLockOn" value="on" checked>
+                    <label for="stlLockOn">On</label>
+                    <input type="radio" name="stlLock" id="stlLockOff" value="off">
+                    <label for="stlLockOff">Off</label>
+                  </div>
+                  <div class="field-hint" id="stlLockHint">
+                    Uses non_design_elements.csv from the selected folder.
                   </div>
                 </div>
               </div>
@@ -4559,7 +4768,11 @@ HTML = r"""<!DOCTYPE html>
       <div class="stale-files-title">&#9888; Leftover Files Detected</div>
       <div class="stale-files-dir" id="staleFilesDir"></div>
       <div class="stale-files-desc">
-        The following files were left behind by a previous run and must be removed before launching — Abaqus will refuse to start if a lock file is present. They will be sent to the <strong>Recycle Bin</strong>.
+        The following files were left behind by a previous run, most often one that was
+        cancelled part way through an iteration. They must be removed before launching,
+        because Abaqus refuses to start a job whose lock file is still present, and
+        because leaving them mixes two different optimisations in the same folder.
+        They will be sent to the <strong>Recycle Bin</strong>.
       </div>
       <div class="stale-files-list" id="staleFilesList"></div>
       <div class="stale-files-actions">
@@ -4736,6 +4949,33 @@ function enforceLatticeModeConstraints() {
 function toggleThermalParams() {
   const on = document.getElementById('thermalOn').checked;
   document.getElementById('thermalParamsGroup').classList.toggle('hidden-field', !on);
+  updateOverhangDependentFields();
+}
+
+// [v53] Fields that only mean anything when the overhang penalty actually runs.
+//
+// The "Thermal Step" detected row reports whether the model already contains a
+// thermal step, and warns that one will be injected if not. Nothing is injected
+// when Overhang Mitigation is Off, so with Off that row was a standing yellow
+// warning about something that was never going to happen.
+//
+// Micro Radius feeds micro_weights, which beso_main.py consumes only inside its
+// "if thermal_active:" branches, so with Off the value cannot affect the result.
+//
+// Both are ALSO solid-void only, and switchEngine() drives the same
+// hidden-field class over its .sv-only elements. Composing the two conditions
+// here, and calling this from both switchEngine() and toggleThermalParams(),
+// keeps one rule in charge instead of two that overwrite each other depending
+// on which the user touched last.
+function updateOverhangDependentFields() {
+  const thermalRadio = document.getElementById('thermalOn');
+  const overhangOn   = thermalRadio ? thermalRadio.checked : false;
+  const show         = (currentEngine === 'solid_void') && overhangOn;
+
+  ['detected-thermal-row', 'microRadiusField'].forEach(function(id) {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle('hidden-field', !show);
+  });
 }
 
 function switchEngine(engine) {
@@ -4745,6 +4985,11 @@ function switchEngine(engine) {
   document.querySelectorAll('.sv-only').forEach(el => {
     el.classList.toggle('hidden-field', engine === 'lattice');
   });
+
+  // [v53] The loop above has just re-shown every .sv-only element for the
+  // solid-void engine, including the two that additionally require Overhang On,
+  // so the narrower rule is re-applied on top of it.
+  updateOverhangDependentFields();
   // Toggle lattice-only panels
   document.querySelectorAll('.lat-only').forEach(el => {
     el.classList.toggle('hidden-field', engine === 'solid_void');
@@ -4802,6 +5047,9 @@ window.onload = function() {
   loadDrives();
   loadFolderDrives();
   validateAll();
+  // [v53] Overhang defaults to Off, and neither onchange handler has fired yet,
+  // so the initial hidden state has to be set explicitly.
+  updateOverhangDependentFields();
 };
 
 function checkAbaqus() {
@@ -4873,7 +5121,9 @@ function loadConfig() {
       document.getElementById('inpPath').value = c.model.inp_path;
       inspectInpFile(c.model.inp_path);
     }
-    if (c.model.base_job) document.getElementById('baseJob').value = c.model.base_job;
+    // [v50] Derived from the path rather than restored, so a config written by
+    // an older version cannot reintroduce a job name that disagrees with it.
+    syncJobName();
   }
 
   if (c.optimization) {
@@ -5120,10 +5370,8 @@ function confirmBrowserSelection() {
   if (!browserSelectedPath) return;
   document.getElementById('inpPath').value = browserSelectedPath;
 
-  // Auto-fill base job name from filename
-  const filename = browserSelectedPath.split(/[\\/]/).pop();
-  const jobName  = filename.replace(/\.inp$/i, '');
-  document.getElementById('baseJob').value = jobName;
+  // [v50] Derive the Abaqus-safe job name from the selected file
+  syncJobName();
 
   closeBrowser();
   inspectInpFile(browserSelectedPath);
@@ -5147,6 +5395,7 @@ document.addEventListener('click', function(e) {
 let _inpTypingTimer = null;
 
 function onInpPathTyped() {
+  syncJobName();                    // [v50] keep the derived job name in step
   clearTimeout(_inpTypingTimer);
   _inpTypingTimer = setTimeout(() => {
     const path = document.getElementById('inpPath').value.trim();
@@ -5178,7 +5427,28 @@ function inspectInpFile(path) {
   });
 }
 
-function syncJobName() {}
+// [v50] Must stay equivalent to sanitize_job_name() in beso_launcher.py and
+// in both optimiser engines, so the name shown here is the name Abaqus uses.
+function sanitizeJobName(name) {
+  var safe = String(name || '').trim().replace(/[^A-Za-z0-9_]/g, '_');
+  safe = safe.replace(/^_+/, '').replace(/_+$/, '');
+  if (!safe) return 'beso_job';
+  if (/^[0-9]/.test(safe)) safe = 'job_' + safe;
+  return safe;
+}
+
+function stemFromPath(p) {
+  return String(p || '').trim().split(/[\\/]/).pop().replace(/\.inp$/i, '');
+}
+
+// [v50] Was an empty stub, so the job name box was free text that could
+// silently disagree with the selected file. It is now derived from the path
+// every time the path changes, by any route.
+function syncJobName() {
+  var path = document.getElementById('inpPath').value.trim();
+  document.getElementById('baseJob').value =
+    path ? sanitizeJobName(stemFromPath(path)) : '';
+}
 
 function updateDetectedPanel(data) {
   if (!data.found) return;
@@ -5237,6 +5507,8 @@ function updateDetectedPanel(data) {
 }
 
 function updateValidationFromInspection(data) {
+  // [v50] Keep the derived job name in step with whatever was inspected.
+  if (data.job_name) document.getElementById('baseJob').value = data.job_name;
   if (!data.found) {
     setCheck('chk-inp', 'fail', '✗', 'File not found: ' + document.getElementById('inpPath').value);
     setCheck('chk-nondesign', 'idle', '○', 'Awaiting valid file');
@@ -5406,7 +5678,7 @@ function launchOptimizer() {
     }
   })
   .catch(function() {
-    // If the scan itself fails, proceed — don't block the user
+    // If the scan itself fails, proceed and do not block the user
     doLaunch(payload);
   });
 }
@@ -5419,9 +5691,10 @@ function showStaleFilesModal(files, directory, payload) {
   _staleFilesPayload = payload;
   _staleFilesItems   = files;
 
-  // Directory note
+  // Directory note. [v50] These now live in the run folder, not next to the
+  // user's model, because the optimiser solves a staged working copy.
   document.getElementById('staleFilesDir').textContent =
-    'Located in: ' + (directory || 'the same folder as your INP file');
+    'Located in: ' + (directory || 'the folder containing the BESO scripts');
 
   // File list
   const listEl = document.getElementById('staleFilesList');
@@ -5463,7 +5736,7 @@ function confirmStaleAndLaunch() {
       const failed = (data.results || []).filter(function(r) { return !r.success; })
                                          .map(function(r) { return r.path.split(/[\\/]/).pop(); });
       if (failed.length) {
-        alert('Warning: could not remove the following files — you may need to delete them manually before Abaqus can run:\n\n' + failed.join('\n'));
+        alert('Warning: could not remove the following files. You may need to delete them manually before Abaqus can run:\n\n' + failed.join('\n'));
       }
     }
     doLaunch(payload);
@@ -5502,8 +5775,9 @@ function gatherSettings() {
   const base = {
     engine: currentEngine,
     model: {
-      base_job: document.getElementById('baseJob').value.trim() ||
-                document.getElementById('inpPath').value.split(/[\\/]/).pop().replace(/\.inp$/i,''),
+      // [v50] inp_path is the source of truth; base_job is purely derived from
+      // it, so the file the checks validate is the file the optimiser opens.
+      base_job: sanitizeJobName(stemFromPath(document.getElementById('inpPath').value)),
       inp_path: document.getElementById('inpPath').value.trim(),
       detected_element_type:  inspectionData ? inspectionData.element_type  : null,
       detected_element_count: inspectionData ? inspectionData.element_count : 0
@@ -5624,12 +5898,12 @@ function applyRunCancelledState() {
   document.querySelectorAll('input, button').forEach(function(el) { el.disabled = false; });
   updateLaunchButton();
 
-  // Show cancelled state — fresh span ensures animation always restarts
+  // Show cancelled state. A fresh span ensures the animation always restarts
   var btn = document.getElementById('launchBtn');
   btn.className = 'btn-launch cancelled';
   btn.innerHTML = '&#10005; CANCELLED<span class="cancel-drain-bar"></span>';
 
-  // After 1s the drain animation finishes — reset to normal
+  // After 1s the drain animation finishes, so reset to normal
   setTimeout(function() {
     _cancelInProgress = false;
     btn.classList.remove('cancelled');
@@ -5654,7 +5928,7 @@ function applySTLCancelledState() {
   var cancelBtn = document.getElementById('stlCancelBtn');
   if (cancelBtn) cancelBtn.classList.remove('visible');
 
-  // Show cancelled state on STL button — fresh span ensures animation restarts
+  // Show cancelled state on the STL button. A fresh span restarts the animation
   var btn = document.getElementById('stlGenerateBtn');
   btn.className = 'btn-launch cancelled';
   btn.innerHTML = '&#10005; CANCELLED<span class="cancel-drain-bar"></span>';
@@ -5749,7 +6023,7 @@ function pollRunStatus() {
 }
 
 function handleRunStatus(d) {
-  if (_cancelInProgress) return;  // cancel animation owns the button — ignore poll responses
+  if (_cancelInProgress) return;  // cancel animation owns the button, so ignore poll responses
   _runStatus = d.status;
 
   // Previous-session detection (only when idle and not in a fresh run)
@@ -6592,6 +6866,9 @@ function checkStlFolder(path) {
       updateCsvStatus('csv-nodes',    data.nodes);
       updateCsvStatus('csv-elements', data.elements);
       updateCsvStatus('csv-solid',    data.solid);
+      // [v54] Optional input: amber rather than red when absent.
+      updateCsvStatus('csv-nondesign', data.non_design, true);
+      updateLockHint(data.non_design, data.non_design_path);
     } else {
       updateCsvStatus('csv-density-map', data.density_map);
       try {
@@ -6623,10 +6900,28 @@ function checkStlFolder(path) {
   });
 }
 
-function updateCsvStatus(id, found) {
+function updateCsvStatus(id, found, optional) {
   const el = document.getElementById(id);
   if (!el) return;
-  el.className = 'csv-status-item ' + (found ? 'found' : 'missing');
+  // [v54] An optional input that is absent is amber, not red: generation still
+  // succeeds, it just cannot hold the protected features still.
+  const absent = optional ? 'optional-missing' : 'missing';
+  el.className = 'csv-status-item ' + (found ? 'found' : absent);
+}
+
+// [v54] Explain, in place, what the lock will actually do for this folder.
+function updateLockHint(found, path) {
+  const hint = document.getElementById('stlLockHint');
+  if (!hint) return;
+  if (found) {
+    hint.textContent = 'Using ' + (path || 'non_design_elements.csv') + '.';
+    hint.style.color = '';
+  } else {
+    hint.textContent = 'non_design_elements.csv was not found in this folder or '
+      + 'its parent, so nothing can be protected and the whole part will be '
+      + 'smoothed uniformly.';
+    hint.style.color = 'var(--yellow)';
+  }
 }
 
 // --- Lattice pre-flight ---
@@ -6983,7 +7278,9 @@ function updateOutputPreview() {
 
 // --- Smooth toggle (solid-void) ---
 function toggleSmoothOptions() {
-  const on = document.querySelector('input[name="stlSmooth"]:checked').value === 'on';
+  // [v54] Three-way now (off / taubin / hc), so anything that is not 'off'
+  // shows the iteration and strength fields.
+  const on = document.querySelector('input[name="stlSmooth"]:checked').value !== 'off';
   document.getElementById('smoothIterField').style.display = on ? 'block' : 'none';
 }
 
@@ -7047,10 +7344,16 @@ function _doGenerateSTL(folder, output) {
 
   let payload;
   if (_stlEngine === 'solid_void') {
-    const smooth = document.querySelector('input[name="stlSmooth"]:checked').value === 'on';
-    const iter   = parseInt(document.getElementById('stlSmoothIter').value);
-    const lam    = parseFloat(document.getElementById('stlSmoothLambda').value);
-    payload = {engine: 'solid_void', folder, output, smooth, smooth_iter: iter, smooth_lambda: lam};
+    // [v54] smooth_method carries the choice; smooth stays in the payload for
+    // anything still reading the old key.
+    const method  = document.querySelector('input[name="stlSmooth"]:checked').value;
+    const iter    = parseInt(document.getElementById('stlSmoothIter').value);
+    const lam     = parseFloat(document.getElementById('stlSmoothLambda').value);
+    const protect = document.querySelector('input[name="stlLock"]:checked').value === 'on';
+    payload = {engine: 'solid_void', folder, output,
+               smooth: method !== 'off', smooth_method: method,
+               smooth_iter: iter, smooth_lambda: lam,
+               protect_non_design: protect};
   } else {
     const lattice  = document.getElementById('stlLatticeType').value;
     const period   = parseFloat(document.getElementById('stlPeriod').value) || 2.0;
@@ -7574,20 +7877,45 @@ class BESOHandler(http.server.BaseHTTPRequestHandler):
             solid_path = os.path.join(folder, "best_solid_elements.csv")
             out_path   = output if output else os.path.join(folder, "optimized_structure.stl")
 
-            stl_script = "beso_stl_generator.py"
-            for d in [work_dir, os.getcwd()]:
-                candidate = os.path.join(d, stl_script)
-                if os.path.exists(candidate):
-                    stl_script = candidate
-                    break
+            # [v52] Resolved in SCRIPT_DIR only, with a real error path. This
+            # previously fell through keeping the bare filename and spawned it
+            # anyway, so a missing generator surfaced as a raw Python "can't open
+            # file" line in the STL log rather than as an explained failure.
+            stl_script = resolve_spawned_script("beso_stl_generator.py")
+            if stl_script is None:
+                self._json_response({"success": False,
+                                     "error": missing_script_error("beso_stl_generator.py")})
+                return
 
-            smooth      = data.get("smooth", False)
-            smooth_iter = data.get("smooth_iter", 10)
-            smooth_lam  = data.get("smooth_lambda", 0.5)
             cmd = 'python "{}" --nodes "{}" --elements "{}" --solid "{}" --output "{}"'.format(
                 stl_script, nodes_path, elems_path, solid_path, out_path)
-            if smooth:
-                cmd += ' --smooth --smooth-iter {} --smooth-lambda {}'.format(smooth_iter, smooth_lam)
+
+            # [v54] Non-design locking. The generator defaults --non-design to
+            # the bare name "non_design_elements.csv", which it resolves against
+            # its own working directory (the script folder), NOT the selected
+            # data folder. So it was never found and the lock never engaged:
+            # "Proceeding with NOTHING locked; functional features will be
+            # smoothed too." The resolved path is now passed explicitly.
+            protect  = data.get("protect_non_design", True)
+            nd_path  = find_non_design_csv(folder)
+            if protect and nd_path:
+                cmd += ' --non-design "{}"'.format(nd_path)
+                # Recommended by the generator's own documentation. Flat locked
+                # faces may move up to this far perpendicular to themselves,
+                # which flattens leftover voxel bumps on them. It is a ceiling,
+                # not a forced move, and bores and sharp edges stay pinned.
+                cmd += ' --lock-normal-cap 0.5'
+            elif not protect:
+                cmd += ' --no-lock'
+
+            smooth_method = data.get("smooth_method", "")
+            if smooth_method in ("taubin", "hc"):
+                smooth_iter = data.get("smooth_iter", 60)
+                smooth_lam  = data.get("smooth_lambda", 0.5)
+                cmd += ' --smooth --smooth-method {} --smooth-iter {} --smooth-lambda {}'.format(
+                    smooth_method, smooth_iter, smooth_lam)
+                if smooth_method == "taubin":
+                    cmd += ' --smooth-mu {}'.format(taubin_mu(smooth_lam))
 
         else:  # lattice
             csv_path    = os.path.join(folder, "Optimized_Density_Map.csv")
@@ -7600,12 +7928,12 @@ class BESOHandler(http.server.BaseHTTPRequestHandler):
             decim_mode  = data.get("decimation_mode", "auto")
             density_floor = data.get("density_floor", None)
 
-            stl_script = "beso_lattice_stl_generator.py"
-            for d in [work_dir, os.getcwd()]:
-                candidate = os.path.join(d, stl_script)
-                if os.path.exists(candidate):
-                    stl_script = candidate
-                    break
+            # [v52] See the note on the solid-void generator above.
+            stl_script = resolve_spawned_script("beso_lattice_stl_generator.py")
+            if stl_script is None:
+                self._json_response({"success": False,
+                                     "error": missing_script_error("beso_lattice_stl_generator.py")})
+                return
 
             cmd = ('python "{}" --csv "{}" --output "{}" --lattice-type {} '
                    '--subgrid {} --period {} --smooth-sigma {} '
@@ -7654,13 +7982,14 @@ class BESOHandler(http.server.BaseHTTPRequestHandler):
         decim       = float(data.get("decimation", 0.90))
         decim_mode  = data.get("decimation_mode", "auto")
 
-        work_dir   = os.path.dirname(os.path.abspath(__file__))
-        stl_script = "beso_lattice_stl_generator.py"
-        for d in [work_dir, os.getcwd()]:
-            candidate = os.path.join(d, stl_script)
-            if os.path.exists(candidate):
-                stl_script = candidate
-                break
+        work_dir   = SCRIPT_DIR
+        # [v52] See the note in _api_launch_stl. This endpoint replies with a
+        # bare {"error": ...}, so the failure is reported in that shape.
+        stl_script = resolve_spawned_script("beso_lattice_stl_generator.py")
+        if stl_script is None:
+            self._json_response({"error": missing_script_error(
+                "beso_lattice_stl_generator.py")})
+            return
 
         cmd = ('python "{}" --csv "{}" --lattice-type {} --subgrid {} '
                '--period {} --decimation {} --decimation-mode {} --preflight-only').format(
@@ -7777,21 +8106,29 @@ class BESOHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # Determine which optimizer to run
+        #
+        # [v51] Resolved against SCRIPT_DIR, the folder the subprocess actually
+        # runs in. This used to call os.path.exists() against the launcher's own
+        # working directory, which is a different folder whenever the launcher is
+        # started from somewhere else, so the check tested a file that was not
+        # the one about to be executed.
+        #
+        # Fallback lists of historical engine filenames were removed with it.
+        # Those files no longer exist, so the lists were dead in every normal
+        # case; the one case where they were not dead was harmful, since a stray
+        # file matching an old name in the launcher's working directory would be
+        # selected and then fail to run, because it is not in SCRIPT_DIR.
         engine = data.get("engine", "solid_void")
-        if engine == "lattice":
-            optimizer_script = "beso_lattice_main.py"
-            if not os.path.exists(optimizer_script):
-                for name in ["beso_main_lattice.py", "beso_lattice.py"]:
-                    if os.path.exists(name):
-                        optimizer_script = name
-                        break
-        else:
-            optimizer_script = "beso_main.py"
-            if not os.path.exists(optimizer_script):
-                for name in ["beso_main_comparison_pre_stlgenerator.py", "beso_optimizer.py"]:
-                    if os.path.exists(name):
-                        optimizer_script = name
-                        break
+        optimizer_script = ("beso_lattice_main.py" if engine == "lattice"
+                            else "beso_main.py")
+
+        if not os.path.isfile(os.path.join(SCRIPT_DIR, optimizer_script)):
+            # [v51] There was previously no error path here at all: a missing
+            # engine was launched anyway and surfaced as a cryptic Abaqus message
+            # buried in the run log. Now it is caught before anything starts.
+            self._json_response({"success": False,
+                                 "error": missing_script_error(optimizer_script)})
+            return
 
         def run():
             with _run_lock:
@@ -7812,7 +8149,7 @@ class BESOHandler(http.server.BaseHTTPRequestHandler):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     env=dict(os.environ, PYTHONUNBUFFERED='1'),
-                    cwd=os.path.dirname(os.path.abspath(__file__))
+                    cwd=SCRIPT_DIR          # [v51] same folder we resolved in
                 )
                 write_pid_file(proc.pid, engine)
 
