@@ -11,7 +11,6 @@ laser melting.
 > **Thesis:** *Topology Structural Optimisation of Components for the Automotive
 > Industry: Focusing on Hypercar Design and Additive Manufacturing*,
 > Miguel Dias de Lima, FEUP, 2026.
-> <!-- TODO: add a link to the published/deposited dissertation once available -->
 
 ## The scripts
 
