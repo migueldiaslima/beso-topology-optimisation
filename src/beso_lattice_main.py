@@ -92,6 +92,7 @@ import csv
 import math
 import shutil
 import json
+import hashlib
 import numpy as np
 from scipy.spatial import cKDTree
 from scipy.sparse import csr_matrix 
@@ -224,11 +225,303 @@ DIR_SCRATCH = os.path.join(MASTER_DIR, "Scratch_Temp")
 # --- CONFIG FILE ---
 CONFIG_FILE = "beso_config.json"
 
+# =============================================================
+# BASE MODEL RESOLUTION AND STAGING  [v50]
+# -------------------------------------------------------------
+# Mirrors the same section in beso_main.py, so both engines resolve, name and
+# stage the base model in exactly the same way. The model used to be a bare
+# stem ("beam_beso_base") opened relative to the working directory, which
+# forced the INP to live next to the scripts and made the file name double as
+# the Abaqus job name. It is now resolved from an explicit path, given a
+# sanitised job name, and copied into the working folder before solving.
+#
+# This matters more here than in the solid-void engine: inject_custom_fields
+# reopens the base ODB with readOnly=False and writes TRUE_UTILIZATION and
+# DENSITY into it. Working on a staged copy means that write lands in the run
+# folder rather than beside the user's own model.
+#
+# Resolution order:
+#   1. the archived copy in INP_Files (prefer_archive; the lattice engine has
+#      no resume yet, so it always passes False, but the two engines are kept
+#      symmetric so resume can be added without touching this code),
+#   2. model.inp_path from beso_config.json,
+#   3. base_job + ".inp" relative to the working directory (legacy behaviour).
+# =============================================================
+
+BASE_MANIFEST_NAME = "base_model.json"
+
+
+def sanitize_job_name(name):
+    """Return an Abaqus-safe job name: letters, digits and underscores only,
+    never starting with a digit. Anything else becomes an underscore."""
+    safe = ""
+    for ch in str(name).strip():
+        if ("a" <= ch <= "z") or ("A" <= ch <= "Z") or \
+           ("0" <= ch <= "9") or ch == "_":
+            safe += ch
+        else:
+            safe += "_"
+    safe = safe.strip("_")
+    if not safe:
+        return "beso_job"
+    if "0" <= safe[0] <= "9":
+        safe = "job_" + safe
+    return safe
+
+
+def file_signature(path):
+    """(size_in_bytes, md5_hex) for a file, or (None, None) if unreadable."""
+    try:
+        size = os.path.getsize(path)
+        digest = hashlib.md5()
+        handle = open(path, "rb")
+        try:
+            while True:
+                chunk = handle.read(1048576)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        finally:
+            handle.close()
+        return size, digest.hexdigest()
+    except Exception:
+        return None, None
+
+
+def describe_size(n_bytes):
+    if n_bytes is None:
+        return "unknown size"
+    if n_bytes >= 1048576:
+        return "{:.1f} MB".format(n_bytes / 1048576.0)
+    if n_bytes >= 1024:
+        return "{:.1f} kB".format(n_bytes / 1024.0)
+    return "{} B".format(n_bytes)
+
+
+def find_archived_base(dir_inp, job_hint):
+    """Locate the base model archived inside a run folder's INP_Files. Prefers
+    <job_hint>.inp; otherwise accepts a single non-iteration .inp."""
+    if not dir_inp or not os.path.isdir(dir_inp):
+        return None
+    if job_hint:
+        candidate = os.path.join(dir_inp, sanitize_job_name(job_hint) + ".inp")
+        if os.path.isfile(candidate):
+            return candidate
+    loose = []
+    for name in os.listdir(dir_inp):
+        if not name.lower().endswith(".inp"):
+            continue
+        if name.lower().startswith("iteration_"):
+            continue
+        loose.append(os.path.join(dir_inp, name))
+    if len(loose) == 1:
+        return loose[0]
+    return None
+
+
+def resolve_base_model(inp_path, base_job, dir_inp, prefer_archive):
+    """Decide which INP file is the base model for this run.
+
+    Returns {source, job_name, size, md5, origin} or None when nothing usable
+    was found (the caller aborts)."""
+    archived = find_archived_base(dir_inp, base_job) if prefer_archive else None
+
+    candidates = []
+    if archived:
+        candidates.append(("archived copy in " + dir_inp, archived))
+    if inp_path:
+        candidates.append(("config model.inp_path", inp_path))
+    if base_job:
+        legacy = base_job if base_job.lower().endswith(".inp") \
+            else base_job + ".inp"
+        candidates.append(("base_job next to the scripts", legacy))
+
+    chosen = None
+    tried = []
+    for origin, candidate in candidates:
+        tried.append("{}  ->  {}".format(origin, os.path.abspath(candidate)))
+        if chosen is None and os.path.isfile(candidate):
+            chosen = (origin, candidate)
+
+    if chosen is None:
+        print("\n   [v50][ERROR] Base model INP file not found.")
+        if tried:
+            print("   Paths tried, in order:")
+            for entry in tried:
+                print("     - {}".format(entry))
+        else:
+            print("   No path was supplied at all.")
+        print("   Set 'model' -> 'inp_path' in beso_config.json to the full path")
+        print("   of your .inp file, or place the file next to the scripts.")
+        return None
+
+    origin, source = chosen
+    source = os.path.abspath(source)
+
+    if prefer_archive and archived and inp_path and os.path.isfile(inp_path):
+        arch_size, arch_md5 = file_signature(archived)
+        conf_size, conf_md5 = file_signature(inp_path)
+        if arch_md5 is not None and conf_md5 is not None and arch_md5 != conf_md5:
+            print("\n   [v50][ERROR] This run folder was built from a different")
+            print("   model than the one now configured.")
+            print("     archived:   {}  ({}, md5 {})".format(
+                  archived, describe_size(arch_size), arch_md5))
+            print("     configured: {}  ({}, md5 {})".format(
+                  os.path.abspath(inp_path), describe_size(conf_size), conf_md5))
+            print("   Aborting rather than guessing which one was meant.")
+            return None
+
+    size, md5 = file_signature(source)
+    original_stem = os.path.splitext(os.path.basename(source))[0]
+    job_name = sanitize_job_name(original_stem)
+
+    print("\n-> [v50] BASE MODEL")
+    print("   Source:    {}".format(source))
+    print("   Found via: {}".format(origin))
+    print("   Size:      {}   md5: {}".format(describe_size(size), md5))
+    print("   Job name:  {}".format(job_name))
+    if job_name != original_stem:
+        print("   [note] '{}' is not a valid Abaqus job name, so this run uses"
+              .format(original_stem))
+        print("          '{}'. Your file keeps its own name and is never"
+              .format(job_name))
+        print("          modified.")
+
+    return {"source": source, "job_name": job_name,
+            "size": size, "md5": md5, "origin": origin}
+
+
+def stage_base_model(source, job_name):
+    """Copy the base model into the working directory as <job_name>.inp so the
+    solver never touches the user's own file.
+
+    Returns (local_path, staged_is_copy). staged_is_copy is False in the legacy
+    layout, where the user's own file already sits at the working-copy path: in
+    that case it is THEIR file, so it must never be moved away afterwards."""
+    local = job_name + ".inp"
+    if os.path.abspath(source) == os.path.abspath(local):
+        print("-> [v50] Base model is already at the working path ({}).".format(local))
+        print("         It will be archived by copy, not moved, so your file stays put.")
+        return local, False
+    shutil.copyfile(source, local)
+    print("-> [v50] Staged working copy: {}".format(os.path.abspath(local)))
+    print("         The original file is left untouched.")
+    return local, True
+
+
+def _safe_move(src, dst):
+    """shutil.move that overwrites an existing destination instead of failing,
+    so re-running in the same folder is not an error. Returns True if moved."""
+    if not os.path.exists(src):
+        return False
+    try:
+        if os.path.exists(dst):
+            os.remove(dst)
+        shutil.move(src, dst)
+        return True
+    except Exception:
+        return False
+
+
+def archive_preflight_artifacts(job_name, dir_inp, dir_odb, dir_misc,
+                                staged_is_copy=True):
+    """[v50] Tidy everything the base solve left in the working folder. The
+    staged working copy goes to INP_Files (so the run folder keeps an exact
+    snapshot of the model that produced it), the ODB to ODB_Files and the rest
+    to Misc_Abaqus_Files. Overwrite-safe, unlike cleanup_files, so re-running
+    in the same folder does not fail."""
+    moved = []
+    dest_inp = os.path.join(dir_inp, job_name + ".inp")
+    if staged_is_copy:
+        # Our own staged copy: move it, nothing else refers to it.
+        if _safe_move(job_name + ".inp", dest_inp):
+            moved.append(job_name + ".inp")
+    else:
+        # Legacy layout: this is the user's own file sitting at the working
+        # path. Archive a copy and leave their file exactly where they put it.
+        try:
+            if os.path.isfile(job_name + ".inp"):
+                if os.path.exists(dest_inp):
+                    os.remove(dest_inp)
+                shutil.copyfile(job_name + ".inp", dest_inp)
+                print("-> [v50] Base model archived by copy; your file stays at {}"
+                      .format(os.path.abspath(job_name + ".inp")))
+        except Exception as e:
+            print("   [v50][WARN] Could not archive the base model: {}".format(e))
+    if _safe_move(job_name + ".odb", os.path.join(dir_odb, job_name + ".odb")):
+        moved.append(job_name + ".odb")
+    for ext in ['.dat', '.msg', '.sta', '.prt', '.com', '.sim',
+                '.abq', '.mdl', '.stt']:
+        if _safe_move(job_name + ext, os.path.join(dir_misc, job_name + ext)):
+            moved.append(job_name + ext)
+    print("-> [v50] Base solve artefacts tidied: {} file(s) moved out of the "
+          "working folder.".format(len(moved)))
+    return os.path.join(dir_inp, job_name + ".inp")
+
+
+def write_base_manifest(dir_data, info):
+    """Record which model this run folder belongs to."""
+    try:
+        with open(os.path.join(dir_data, BASE_MANIFEST_NAME), "w") as f:
+            json.dump(info, f, indent=2)
+    except Exception as e:
+        print("   [v50][WARN] Could not write the base model manifest: {}".format(e))
+
+
+def guess_default_inp():
+    """A sensible default for the interactive prompt: the single .inp in the
+    working folder, or beam_beso_base.inp when it is present."""
+    try:
+        found = []
+        for name in os.listdir("."):
+            if not name.lower().endswith(".inp"):
+                continue
+            if name.lower().startswith("iteration_"):
+                continue
+            found.append(name)
+    except Exception:
+        return None
+    if len(found) == 1:
+        return found[0]
+    for name in found:
+        if name.lower() == "beam_beso_base.inp":
+            return name
+    return None
+
+
+def prompt_for_base_inp():
+    """[v50] Ask for the base model in standalone (no config) mode. Accepts a
+    full path, a relative path or a plain file name. Returns (inp_path,
+    base_job). Previously this was hard-coded to beam_beso_base with no
+    prompt at all."""
+    default_inp = guess_default_inp()
+    print("\nBASE MODEL")
+    print("  Full path, relative path or file name. The file is copied into the")
+    print("  working folder before solving and is never modified.")
+    if default_inp:
+        answer = raw_input("Base INP file (Enter for {}): ".format(default_inp))
+    else:
+        answer = raw_input("Base INP file: ")
+    answer = answer.strip().strip('"').strip("'")
+    if not answer:
+        answer = default_inp if default_inp else "beam_beso_base.inp"
+    if not answer.lower().endswith(".inp"):
+        answer = answer + ".inp"
+    if os.path.isfile(answer):
+        print("-> Using {}".format(os.path.abspath(answer)))
+    else:
+        print("-> [WARNING] {} does not exist. The run will stop at the base "
+              "model check.".format(os.path.abspath(answer)))
+    job = sanitize_job_name(os.path.splitext(os.path.basename(answer))[0])
+    print("-> Job name: {}".format(job))
+    return answer, job
+
+
 # --- 1. RUNNER FUNCTION ---
 def run_abaqus_job(job_name, input_name, cpus=4, memory_percent=90):
     print("-> Running Abaqus Job: {}... (Please wait)".format(job_name))
     abs_scratch_path = os.path.abspath(DIR_SCRATCH)
-    command = "abaqus job={} input={} cpus={} memory={}% scratch=\"{}\" ask_delete=OFF interactive".format(
+    command = "abaqus job={} input=\"{}\" cpus={} memory={}% scratch=\"{}\" ask_delete=OFF interactive".format(
         job_name, input_name, cpus, memory_percent, abs_scratch_path)
     os.system(command)
 
@@ -1515,6 +1808,7 @@ def load_config_or_prompt():
                 safety_factor        = float(opt.get("safety_factor", 1.0))
 
                 base_job             = str(mdl.get("base_job", "beam_beso_base"))
+                inp_path             = str(mdl.get("inp_path", "")).strip()
                 max_iterations       = int(adv.get("max_iterations", 200))
                 filter_multiplier    = int(adv.get("filter_multiplier", 3))
                 early_stop_warmup    = int(adv.get("early_stop_warmup", 15))
@@ -1525,6 +1819,8 @@ def load_config_or_prompt():
 
                 print("   Timestamp:           {}".format(cfg.get("timestamp", "unknown")))
                 print("   Base Job:            {}".format(base_job))
+                print("   Model INP:           {}".format(
+                      inp_path if inp_path else "(not set, will look next to the scripts)"))
                 print("   Filter:              {}".format("Gaussian" if is_gaussian_filter else "Linear"))
                 print("   Lattice Philosophy:  {}".format("Continuous FGL" if is_continuous else "Discrete 3-Bin"))
                 print("   Smart Skin:          {}".format("Enabled" if enable_skin else "Disabled"))
@@ -1554,7 +1850,7 @@ def load_config_or_prompt():
                 print("\n" + "="*50 + "\n")
 
                 return (is_gaussian_filter, is_continuous, enable_skin,
-                        custom_weights, base_job, max_iterations, filter_multiplier, cpus,
+                        custom_weights, base_job, inp_path, max_iterations, filter_multiplier, cpus,
                         memory_percent, yield_stress, gibson_ashby_exp, yield_exponent,
                         evolution_quota_pct, void_threshold_pct, move_limit,
                         early_stop_warmup, early_stop_patience, early_stop_flatline,
@@ -1572,6 +1868,10 @@ def load_config_or_prompt():
     print("\n" + "="*50)
     print("      ADAMASTOR LATTICE OPTIMIZATION ENGINE")
     print("="*50)
+
+    # [v50] The base model is asked for FIRST, so a wrong path is caught before
+    # working through every optimisation question.
+    inp_path, base_job = prompt_for_base_inp()
 
     print("\nSelect Spatial Filter Philosophy:")
     print("  1. Linear (Sharper boundaries between lattice grades)")
@@ -1638,7 +1938,7 @@ def load_config_or_prompt():
 
     # Hardcoded defaults for fallback mode - match the defaults in the launcher
     return (is_gaussian_filter, is_continuous, enable_skin,
-            None, "beam_beso_base", 200, 3, 1,
+            None, base_job, inp_path, 200, 3, 1,
             90, 400.0, gibson_ashby_exp, yield_exponent,
             1, 10.0, 1.0,
             25, 15, 0.0001,
@@ -1674,7 +1974,7 @@ if __name__ == "__main__":
     print("-> Run log: mirroring terminal output to {}".format(_run_log_path))
 
     (IS_GAUSSIAN, IS_CONTINUOUS, ENABLE_SKIN,
-     _custom_weights, base_job, MAX_ITERATIONS, FILTER_MULTIPLIER, _cpus,
+     _custom_weights, base_job, inp_path, MAX_ITERATIONS, FILTER_MULTIPLIER, _cpus,
      _memory_percent, _yield_stress, _gibson_ashby_exp, _yield_exponent,
      _evolution_quota_pct, _void_threshold_pct, _move_limit,
      _early_stop_warmup, _early_stop_patience, _early_stop_flatline,
@@ -1691,17 +1991,36 @@ if __name__ == "__main__":
         if not os.path.exists(directory):
             os.makedirs(directory)
 
+    # [v50] Resolve the base model, then stage a working copy. The lattice
+    # engine has no resume yet, so prefer_archive is False; the argument exists
+    # so the two engines stay symmetric when resume is added.
+    _base_info = resolve_base_model(inp_path, base_job, DIR_INP,
+                                    prefer_archive=False)
+    if _base_info is None:
+        sys.exit(1)
+    base_job      = _base_info["job_name"]
+    base_inp_path = _base_info["source"]
+
+    _local_base_inp, _staged_is_copy = stage_base_model(base_inp_path, base_job)
+    write_base_manifest(DIR_DATA, {
+        "original_path": _base_info["source"],
+        "found_via":     _base_info["origin"],
+        "job_name":      base_job,
+        "size_bytes":    _base_info["size"],
+        "md5":           _base_info["md5"],
+        "recorded":      time.strftime("%Y-%m-%d %H:%M:%S")})
+
     current_job = base_job
     current_inp = base_job
     
     # --- 1. THE AUTONOMOUS EXTRACTION ---
     # We call the master parser on the base INP file before doing anything else!
-    global_design_part, global_non_design_list = find_design_part_and_non_design(base_job + ".inp", set_name="NON_DESIGN_SET")
+    global_design_part, global_non_design_list = find_design_part_and_non_design(base_inp_path, set_name="NON_DESIGN_SET")
     if len(global_non_design_list) == 0:
         print("   [WARNING] No NON_DESIGN_SET elements detected - the ENTIRE mesh will be")
         print("             treated as design space. If you intended a protected region,")
         print("             check the set name and its definition in the INP.")
-    global_model_data = extract_global_inp_data(base_job + ".inp", global_design_part)
+    global_model_data = extract_global_inp_data(base_inp_path, global_design_part)
     
     # Use config yield stress (launcher populates it from the same heuristic, so
     # this transparently becomes a user override when they change it)
@@ -1745,7 +2064,10 @@ if __name__ == "__main__":
     stiffness_history.append(initial_k)
     specific_stiffness_history.append(initial_spec_k)
     
-    cleanup_files(current_job, keep_inp=True)
+    # [v50] Was cleanup_files(keep_inp=True), which left the staged copy loose
+    # in the working folder. The copy is now archived into INP_Files with the
+    # rest of the artefacts, so nothing is left behind.
+    archive_preflight_artifacts(base_job, DIR_INP, DIR_ODB, DIR_MISC, _staged_is_copy)
 
     # Track Initial Data
     initial_max_stress = max(raw_mises_dict.values())
@@ -1764,7 +2086,9 @@ if __name__ == "__main__":
 
     # Load Base INP into RAM for ultra-fast generation
     print("-> Loading base INP file into RAM...")
-    with open(base_job + ".inp", 'r') as f:
+    # [v50] Reads the resolved source, not the staged copy: by this point the
+    # copy has been archived into INP_Files by archive_preflight_artifacts.
+    with open(base_inp_path, 'r') as f:
         ram_base_inp_lines = f.readlines()
 
     # (design part + non-design set already resolved above by find_design_part_and_non_design)
